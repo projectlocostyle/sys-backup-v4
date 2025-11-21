@@ -1,225 +1,185 @@
 #!/bin/bash
 set -euo pipefail
 
-############################################################
-# SYS-BACKUP-V4 – RESTORE AUS NEXTCLOUD (AUTO MODEL RESTORE)
-############################################################
-
-REMOTE_NAME="backup"
+LOG="/var/log/sys-backup-v4/restore.log"
+REMOTE="backup"
 REMOTE_DIR="Server-Backups"
-MODEL_DIR="Server-Backups/models"
+TMP="/tmp/sys-backup-v4"
 
-TMP_BASE="/tmp/sys-backup-v4-restore"
-LOG_DIR="/var/log/sys-backup-v4"
+mkdir -p "$TMP"
+mkdir -p "$(dirname "$LOG")"
 
-SERVICES_DIR="/opt/services"
-COMPOSE_FILE="${SERVICES_DIR}/docker-compose.yml"
+echo "--------------------------------------------------------"
+echo " SYS-BACKUP-V4 – RESTORE"
+echo "--------------------------------------------------------"
 
-mkdir -p "$LOG_DIR" "$TMP_BASE"
+########################################
+# 1) BACKUP AUSWÄHLEN
+########################################
 
-LOG="${LOG_DIR}/restore.log"
+echo "Lade Backup-Liste aus Nextcloud..."
 
-echo "--------------------------------------------------------" | tee -a "$LOG"
-echo " SYS-BACKUP-V4 – RESTORE SYSTEM" | tee -a "$LOG"
-echo "--------------------------------------------------------" | tee -a "$LOG"
-echo "" | tee -a "$LOG"
+BACKUPS=$(rclone lsf "${REMOTE}:${REMOTE_DIR}" --dirs-only)
 
-############################################################
-### 1) LISTE DER BACKUPS AUS NEXTCLOUD
-############################################################
-
-echo "Lese Backups aus Nextcloud..." | tee -a "$LOG"
-
-mapfile -t BACKUPS < <(rclone lsd "${REMOTE_NAME}:${REMOTE_DIR}" | awk '{print $5}' | sort)
-
-if [[ ${#BACKUPS[@]} -eq 0 ]]; then
-  echo "❌ Keine Backups gefunden!" | tee -a "$LOG"
-  exit 1
+if [[ -z "$BACKUPS" ]]; then
+    echo "❌ Keine Backups gefunden!"
+    exit 1
 fi
 
-echo "Verfügbare Backups:" | tee -a "$LOG"
 i=1
-declare -A OPT
-for B in "${BACKUPS[@]}"; do
-  OPT[$i]="$B"
-  echo "  $i) $B" | tee -a "$LOG"
-  ((i++))
-done
+declare -A MAP
 
 echo ""
-read -p "Bitte Backup-Nummer wählen: " CHOICE
+echo "Verfügbare Backups:"
+echo ""
 
-SELECTED="${OPT[$CHOICE]:-}"
+while read -r BK; do
+    [[ -z "$BK" ]] && continue
+    BK=${BK%/}
+    MAP[$i]="$BK"
+    echo "  $i) $BK"
+    ((i++))
+done <<< "$BACKUPS"
+
+echo ""
+read -p "Backup wählen: " CHOICE
+
+SELECTED="${MAP[$CHOICE]}"
+
 if [[ -z "$SELECTED" ]]; then
-  echo "❌ Ungültige Auswahl!" | tee -a "$LOG"
-  exit 1
+    echo "❌ Ungültige Auswahl!"
+    exit 1
 fi
 
-BACKUP_NAME="$SELECTED"
-REMOTE_PATH="${REMOTE_NAME}:${REMOTE_DIR}/${BACKUP_NAME}"
+echo "Ausgewählt: $SELECTED"
+
+########################################
+# 2) BACKUP DOWNLOADEN
+########################################
+
+RESTORE_DIR="${TMP}/${SELECTED}"
+rm -rf "$RESTORE_DIR"
+mkdir -p "$RESTORE_DIR"
 
 echo ""
-echo "Backup gewählt: ${BACKUP_NAME}" | tee -a "$LOG"
+echo "Lade Backup aus Nextcloud..."
+rclone copy "${REMOTE}:${REMOTE_DIR}/${SELECTED}" "$RESTORE_DIR" -P
 
-############################################################
-### 2) BACKUP HERUNTERLADEN
-############################################################
+echo "✔ Backup vollständig geladen."
 
-TMP_DIR="${TMP_BASE}/${BACKUP_NAME}"
-rm -rf "$TMP_DIR"
-mkdir -p "$TMP_DIR"
+########################################
+# 3) MODEL-MANIFEST & MANIFEST
+########################################
 
-echo "Lade Backup nach ${TMP_DIR}..." | tee -a "$LOG"
-rclone copy "${REMOTE_PATH}" "$TMP_DIR" -P | tee -a "$LOG"
-
-MANIFEST="${TMP_DIR}/manifest.yml"
+MANIFEST="${RESTORE_DIR}/manifest.yml"
 
 if [[ ! -f "$MANIFEST" ]]; then
-  echo "❌ Manifest fehlt!" | tee -a "$LOG"
-  exit 1
+    echo "❌ Manifest fehlt!"
+    exit 1
 fi
 
-echo "Manifest gefunden." | tee -a "$LOG"
+echo "✔ Manifest gefunden."
 
-############################################################
-### 3) MANIFEST PARSEN (V4)
-############################################################
-
-BACKUP_HOST=$(awk -F': ' '/^host:/ {print $2}' "$MANIFEST" | tr -d '"')
-BACKUP_IP=$(awk -F': ' '/^ip:/ {print $2}' "$MANIFEST" | tr -d '"')
-MODELS_EXCLUDED=$(awk -F': ' '/models_excluded:/ {print $2}' "$MANIFEST")
+########################################
+# 4) DOCKER STOPPEN
+########################################
 
 echo ""
-echo "Backup Informationen:" | tee -a "$LOG"
-echo "  Host:   ${BACKUP_HOST}" | tee -a "$LOG"
-echo "  IP:     ${BACKUP_IP}" | tee -a "$LOG"
-echo "  Modelle excluded: ${MODELS_EXCLUDED}" | tee -a "$LOG"
-echo "" | tee -a "$LOG"
+echo "Stoppe laufende Dienste..."
+docker compose -f /opt/services/docker-compose.yml down || true
 
-############################################################
-### 4) SYSTEM VORBEREITEN
-############################################################
-
-echo "Stoppe laufende Docker-Container..." | tee -a "$LOG"
-docker stop $(docker ps -q) >/dev/null 2>&1 || true
-
-############################################################
-### 5) VOLUMES RESTORE
-############################################################
+########################################
+# 5) AUTOMATISCHES VOLUME-MAPPING
+########################################
 
 echo ""
-echo "Starte Volume-Restore..." | tee -a "$LOG"
+echo "Ermittle Volume-Mapping..."
 
-VOL_LIST=$(awk '
-/^volumes:/ {read; while ($0 ~ /^[[:space:]]+- /) {gsub(/^[[:space:]]+- /,""); print; getline}}
-' "$MANIFEST")
+# Volumes aus Backup
+BACKUP_VOLUMES=$(ls "${RESTORE_DIR}/volumes" | sed 's/.tar.gz//')
 
-for VOL in $VOL_LIST; do
-  TAR="${TMP_DIR}/volumes/${VOL}.tar.zst"
+# Aktuelle Docker-Volumes
+DOCKER_VOLUMES=$(docker volume ls -q)
 
-  if [[ ! -f "$TAR" ]]; then
-    echo "⚠️ Volume fehlt: $TAR" | tee -a "$LOG"
-    continue
-  fi
+declare -A MATCH
 
-  echo "  Restore Volume: ${VOL}" | tee -a "$LOG"
-  docker volume create "$VOL" >/dev/null
+for B in $BACKUP_VOLUMES; do
+    for LV in $DOCKER_VOLUMES; do
+        # Logik: matched wenn beide Wörter enthalten sind
+        KEYWORD=$(echo "$B" | sed 's/services_//')
+        if [[ "$LV" == *"$KEYWORD"* ]]; then
+            MATCH[$B]="$LV"
+        fi
+    done
+done
 
-  docker run --rm \
-    -v "${VOL}":/restore \
-    -v "${TAR}":/backup.tar.zst \
-    alpine sh -c "rm -rf /restore/* && zstd -d < /backup.tar.zst | tar -xf - -C /restore"
+echo "Gefundene Zuordnungen:"
+for B in "${!MATCH[@]}"; do
+    echo "  $B  →  ${MATCH[$B]}"
+done
+
+########################################
+# 6) VOLUMES RESTOREN
+########################################
+
+echo ""
+echo "Starte Volume-Restore..."
+
+for B in "${!MATCH[@]}"; do
+
+    LV="${MATCH[$B]}"
+    ARCHIVE="${RESTORE_DIR}/volumes/${B}.tar.gz"
+
+    if [[ ! -f "$ARCHIVE" ]]; then
+        echo "⚠️ Volume fehlt im Backup: $B"
+        continue
+    fi
+
+    echo "  ► Restore: $B  →  $LV"
+
+    docker run --rm \
+        -v "${LV}:/restore" \
+        -v "${ARCHIVE}:/backup.tar.gz" \
+        alpine sh -c "rm -rf /restore/* && tar -xzf /backup.tar.gz -C /restore"
 
 done
 
-############################################################
-### 6) BIND MOUNTS RESTORE
-############################################################
+########################################
+# 7) BIND MOUNTS RESTOREN
+########################################
 
 echo ""
-echo "Starte Bind-Mount Restore..." | tee -a "$LOG"
+echo "Starte Bind-Mount-Restore..."
 
-BM_LIST=$(awk '
-/^bind_mounts:/ {read; while ($0 ~ /^[[:space:]]+- /) {gsub(/^[[:space:]]+- /,""); print; getline}}
-' "$MANIFEST")
+for TAR in "${RESTORE_DIR}/bind_mounts/"*.tar.gz; do
+    NAME=$(basename "$TAR" .tar.gz)
+    RESTORE_PATH=$(echo "$NAME" | sed 's/^_//; s/_/\//g')
 
-for SRC in $BM_LIST; do
-  NAME="$(echo "$SRC" | sed 's#/#_#g')"
-  TAR="${TMP_DIR}/bind_mounts/${NAME}.tar.zst"
+    echo "  ► Restore: /$RESTORE_PATH"
 
-  if [[ ! -f "$TAR" ]]; then
-    echo "⚠️ Bind-Mount fehlt: $TAR" | tee -a "$LOG"
-    continue
-  fi
-
-  echo "  Restore: ${SRC}" | tee -a "$LOG"
-  mkdir -p "$SRC"
-  zstd -d < "$TAR" | tar -xf - -C /
+    mkdir -p "/$RESTORE_PATH"
+    tar -xzf "$TAR" -C "/$RESTORE_PATH"
 done
 
-############################################################
-### 7) DOCKER WIEDER STARTEN
-############################################################
-
-if [[ -f "$COMPOSE_FILE" ]]; then
-  echo "Starte Docker Services..." | tee -a "$LOG"
-  cd "$SERVICES_DIR"
-  docker compose up -d | tee -a "$LOG"
-else
-  echo "⚠️ docker-compose.yml NICHT gefunden!" | tee -a "$LOG"
-fi
-
-############################################################
-### 8) MODEL RESTORE (AUTO-DOWNLOAD)
-############################################################
+########################################
+# 8) DOCKER NEU STARTEN
+########################################
 
 echo ""
-echo "Überprüfe Modell-Status..." | tee -a "$LOG"
+echo "Starte Docker-Services..."
+docker compose -f /opt/services/docker-compose.yml up -d
 
-if [[ "$MODELS_EXCLUDED" == "true" ]]; then
-  echo "Modelle wurden im Backup ausgeschlossen. Lade Modelle automatisch nach..." | tee -a "$LOG"
-
-  OLLAMA_LIST=$(awk '
-/^ollama_models:/ {read; while ($0 ~ /^[[:space:]]+- /) {gsub(/^[[:space:]]+- /,""); print; getline}}
-' "$MANIFEST")
-
-  for M in $OLLAMA_LIST; do
-    echo "  💾 Lade Ollama Modell: $M" | tee -a "$LOG"
-    ollama pull "$M" | tee -a "$LOG"
-  done
-
-  OPENWEBUI_LIST=$(awk '
-/^openwebui_models:/ {read; while ($0 ~ /^[[:space:]]+- /) {gsub(/^[[:space:]]+- /,""); print; getline}}
-' "$MANIFEST")
-
-  for M in $OPENWEBUI_LIST; do
-    echo "  💾 Stelle OpenWebUI Modell wieder her: $M" | tee -a "$LOG"
-    mkdir -p "/opt/services/openwebui/models/$M"
-    # Modelle werden NICHT gesichert – nur Ordner angelegt
-  done
-
-fi
-
-############################################################
-### 9) CADDY NEU LADEN
-############################################################
-
-echo "Lade Caddy neu..." | tee -a "$LOG"
-systemctl reload caddy || systemctl restart caddy
-
-############################################################
-### 10) TEMP-DATEN LÖSCHEN
-############################################################
-
-rm -rf "$TMP_DIR"
-
-############################################################
-### 11) ABSCHLUSS
-############################################################
+########################################
+# 9) CADDY RELOAD
+########################################
 
 echo ""
-echo "--------------------------------------------------------" | tee -a "$LOG"
-echo "RESTORE ERFOLGREICH!" | tee -a "$LOG"
-echo "Backup: ${BACKUP_NAME}" | tee -a "$LOG"
-echo "--------------------------------------------------------" | tee -a "$LOG"
+echo "Caddy reload..."
+systemctl reload caddy || true
+
 echo ""
+echo "--------------------------------------------------------"
+echo " RESTORE ERFOLGREICH!"
+echo " Backup: $SELECTED"
+echo "--------------------------------------------------------"
+

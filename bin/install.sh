@@ -56,16 +56,24 @@ else
 fi
 
 ############################################
-### 4) CADDY INSTALLATION
+### 4) CADDY INSTALLATION (NEU & STABIL!)
 ############################################
 
 echo "[4/7] Caddy installieren..."
+
 if ! command -v caddy &> /dev/null; then
+    echo "✔️ Installiere Caddy direkt von caddyserver.com (ohne Cloudsmith)..."
+
     apt install -y debian-keyring debian-archive-keyring apt-transport-https
-    curl -1sSf https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+
+    # GPG Key installieren
+    curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
         | gpg --dearmor -o /usr/share/keyrings/caddy.gpg
-    curl -1sSf https://dl.cloudsmith.io/public/caddy/stable/deb/debian/any-version.deb.txt \
-        | tee /etc/apt/sources.list.d/caddy.list
+
+    # Richtige Repository-Datei
+    echo "deb [signed-by=/usr/share/keyrings/caddy.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" \
+        > /etc/apt/sources.list.d/caddy.list
+
     apt update
     apt install -y caddy
 else
@@ -119,105 +127,61 @@ mkdir -p "$SERVICES_DIR"
 
 cat > "$COMPOSE_FILE" << 'EOF'
 version: "3.9"
-
 services:
   portainer:
     image: portainer/portainer-ce:2.21.4
     container_name: portainer
-    restart: unless-stopped
     ports:
       - "9000:9000"
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - services_portainer_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: openwebui
+    ports:
+      - "3000:8080"
+    volumes:
+      - services_openwebui_data:/app/backend/data
 
   n8n:
     image: docker.n8n.io/n8nio/n8n
     container_name: n8n
-    restart: unless-stopped
     ports:
       - "5678:5678"
-    environment:
-      - N8N_HOST=n8n.ai.locostyle.ch
-      - WEBHOOK_URL=https://n8n.ai.locostyle.ch/
     volumes:
       - services_n8n_data:/home/node/.n8n
 
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
-    restart: unless-stopped
     ports:
       - "11434:11434"
     volumes:
       - services_ollama_data:/root/.ollama
 
-  openwebui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: openwebui
-    restart: unless-stopped
-    ports:
-      - "3000:8080"
-    depends_on:
-      - ollama
-    environment:
-      - OLLAMA_API_BASE=http://ollama:11434
-    volumes:
-      - services_openwebui_data:/app/backend/data
-
   watchtower:
     image: containrrr/watchtower
     container_name: watchtower
-    restart: unless-stopped
+    command: --cleanup --interval 3600
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: --cleanup --schedule "0 0 3 * * *"
 
 volumes:
   services_portainer_data:
+  services_openwebui_data:
   services_n8n_data:
   services_ollama_data:
-  services_openwebui_data:
 EOF
 
 ############################################
-### 7) CADDYFILE ERZEUGEN
+### 7) DOCKER STARTEN
 ############################################
 
-echo "[7/7] Erzeuge Caddyfile..."
+echo "[7/7] Starte Docker-Dienste..."
+docker compose -f "$COMPOSE_FILE" up -d
 
-cat > /etc/caddy/Caddyfile << 'EOF'
-ai.locostyle.ch {
-    respond "OK - ai.locostyle.ch läuft"
-}
-
-n8n.ai.locostyle.ch {
-    reverse_proxy localhost:5678
-}
-
-portainer.ai.locostyle.ch {
-    reverse_proxy localhost:9000
-}
-
-ollama.ai.locostyle.ch {
-    reverse_proxy localhost:11434
-}
-
-openwebui.ai.locostyle.ch {
-    reverse_proxy localhost:3000
-}
-EOF
-
-systemctl reload caddy
-
-echo "Starte Docker-Services..."
-cd "$SERVICES_DIR"
-docker compose up -d
-
-echo ""
 echo "===================================================="
-echo " INSTALLATION ERFOLGREICH ABGESCHLOSSEN"
+echo " Installation abgeschlossen!"
 echo "===================================================="
-echo "Backup-Script:  /opt/sys-backup-v4/bin/backup.sh"
-echo "Restore-Script: /opt/sys-backup-v4/bin/restore.sh"
-echo ""

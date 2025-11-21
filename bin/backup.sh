@@ -2,140 +2,142 @@
 set -euo pipefail
 
 ############################################################
-# SYS-BACKUP-V4 – CLOUD-ONLY BACKUP
+# SYS-BACKUP-V4 – BACKUP SCRIPT (Vollständig funktionierend)
 ############################################################
-
-REMOTE_NAME="backup"
-REMOTE_DIR="Server-Backups"
-
-LOG_DIR="/var/log/sys-backup-v4"
-TMP_BASE="/tmp/sys-backup-v4"
-mkdir -p "$LOG_DIR" "$TMP_BASE"
 
 TIMESTAMP="$(date +%Y-%m-%d_%H-%M-%S)"
 BACKUP_NAME="backup_${TIMESTAMP}"
-TMP_DIR="${TMP_BASE}/${BACKUP_NAME}"
+
+BASE="/opt/sys-backup-v4"
+LOG_DIR="/var/log/sys-backup-v4"
+TMP_BASE="/tmp/sys-backup-v4"
+BACKUP_TMP="${TMP_BASE}/${BACKUP_NAME}"
+
+REMOTE_NAME="backup"
+REMOTE_DIR="Server-Backups/${BACKUP_NAME}"
+
+mkdir -p "$LOG_DIR"
+mkdir -p "$BACKUP_TMP/volumes"
+mkdir -p "$BACKUP_TMP/bind_mounts"
 
 LOG="${LOG_DIR}/backup.log"
 
-echo "--------------------------------------------------------" | tee -a "$LOG"
+echo "--------------------------------------------------------" | tee "$LOG"
 echo "SYS-BACKUP-V4 BACKUP gestartet: ${TIMESTAMP}" | tee -a "$LOG"
 echo "--------------------------------------------------------" | tee -a "$LOG"
-
-mkdir -p "${TMP_DIR}/volumes" "${TMP_DIR}/bind_mounts"
+echo "" | tee -a "$LOG"
 
 ############################################################
-### 1) DOCKER VOLUMES SICHERN
+# 1) MODEL-LISTEN (keine Model-Daten!)
+############################################################
+
+echo "Erfasse Modell-Listen..." | tee -a "$LOG"
+
+echo "models:" > "${BACKUP_TMP}/model_manifest.yml"
+echo "  ollama: Docker-Modus (keine Modelldaten im Backup)" >> "${BACKUP_TMP}/model_manifest.yml"
+
+if [[ -d /opt/services/openwebui/models ]]; then
+    echo "  openwebui:" >> "${BACKUP_TMP}/model_manifest.yml"
+    ls /opt/services/openwebui/models | awk '{print "    - " $1}' >> "${BACKUP_TMP}/model_manifest.yml"
+else
+    echo "  openwebui: kein Modellordner" >> "${BACKUP_TMP}/model_manifest.yml"
+fi
+
+echo "ℹ️ Ollama läuft im Docker – Modelle werden NICHT im normalen Backup gesichert." | tee -a "$LOG"
+
+############################################################
+# 2) DOCKER VOLUME BACKUP
 ############################################################
 
 echo "Starte Volume-Backup..." | tee -a "$LOG"
 
-if command -v docker &>/dev/null; then
-    docker volume ls -q | while read -r VOL; do
-        [ -z "$VOL" ] && continue
-        ARCHIVE="${TMP_DIR}/volumes/${VOL}.tar.gz"
-        echo "  Volume: ${VOL}" | tee -a "$LOG"
+VOLUMES=$(docker volume ls --format '{{.Name}}' | grep '^services_')
 
-        docker run --rm \
-            -v "${VOL}":/data \
-            -v "${TMP_DIR}/volumes":/backup \
-            alpine sh -c "cd /data && tar -czf /backup/$(basename "$ARCHIVE") ."
-    done
-else
-    echo "⚠️ Docker nicht installiert, überspringe Volume-Backup." | tee -a "$LOG"
-fi
+mkdir -p "$BACKUP_TMP/volumes"
 
-############################################################
-### 2) WICHTIGE HOST-PFADE SICHERN
-############################################################
+for VOL in $VOLUMES; do
+    echo "  Volume: $VOL" | tee -a "$LOG"
 
-echo "Starte Bind-Mount / Host-Pfad Backup..." | tee -a "$LOG"
+    ARCHIVE="${BACKUP_TMP}/volumes/${VOL}.tar.gz"
 
-BIND_PATHS=(
-    "/etc/caddy"
-    "/var/lib/caddy"
-    "/opt/services"
-    "/root/.config/rclone"
-    "/opt/sys-backup-v4"
-)
+    docker run --rm \
+        -v "${VOL}:/data:ro" \
+        -v "${BACKUP_TMP}/volumes:/out" \
+        alpine sh -c "cd /data && tar -czf /out/${VOL}.tar.gz ."
 
-for SRC in "${BIND_PATHS[@]}"; do
-    NAME="$(echo "$SRC" | sed 's#/#_#g')"
-    ARCHIVE="${TMP_DIR}/bind_mounts/${NAME}.tar.gz"
-
-    echo "  Pfad: ${SRC}" | tee -a "$LOG"
-
-    if [ -d "$SRC" ] || [ -f "$SRC" ]; then
-        tar -czf "$ARCHIVE" -C / "${SRC#/}"
-    else
-        echo "  ⚠️ Pfad existiert nicht: ${SRC}" | tee -a "$LOG"
-    fi
+    echo "    ✔ Gesichert: $ARCHIVE" | tee -a "$LOG"
 done
 
 ############################################################
-### 3) HASHES ERZEUGEN
+# 3) BIND-MOUNT BACKUP
 ############################################################
 
-echo "Erzeuge Hashes..." | tee -a "$LOG"
+echo "Starte Bind-Mount-Backup..." | tee -a "$LOG"
 
-(
-    cd "$TMP_DIR"
-    find . -type f -name '*.tar.gz' -print0 | sort -z | xargs -0 sha256sum > hashes.sha256
+MOUNTS=(
+    "/etc/caddy"
+    "/opt/services"
+    "/opt/sys-backup-v4"
+    "/root/.config/rclone"
+    "/var/lib/caddy"
 )
 
-echo "Hash-Datei erstellt: ${TMP_DIR}/hashes.sha256" | tee -a "$LOG"
+for SRC in "${MOUNTS[@]}"; do
+    SAFE=$(echo "$SRC" | sed 's/\//_/g')
+    ARCHIVE="${BACKUP_TMP}/bind_mounts/${SAFE}.tar.gz"
+
+    echo "  Bind-Mount: $SRC" | tee -a "$LOG"
+
+    tar -czf "$ARCHIVE" -C "$SRC" .
+
+    echo "    ✔ Gesichert: $ARCHIVE" | tee -a "$LOG"
+done
 
 ############################################################
-### 4) MANIFEST ERZEUGEN
+# 4) HASH-BERECHNUNG
 ############################################################
 
-HOSTNAME="$(hostname)"
-IP_ADDR="$(hostname -I | awk '{print $1}')"
-
-MANIFEST="${TMP_DIR}/manifest.yml"
-
-echo "Erzeuge Manifest..." | tee -a "$LOG"
-
-{
-    echo "host: \"${HOSTNAME}\""
-    echo "ip: \"${IP_ADDR}\""
-    echo "timestamp: \"${TIMESTAMP}\""
-    echo "backup_name: \"${BACKUP_NAME}\""
-    echo ""
-    echo "volumes:"
-    for F in "${TMP_DIR}/volumes"/*.tar.gz; do
-        [ -e "$F" ] || continue
-        VOLNAME="$(basename "$F" .tar.gz)"
-        echo "  - ${VOLNAME}"
-    done
-    echo ""
-    echo "bind_mounts:"
-    for SRC in "${BIND_PATHS[@]}"; do
-        echo "  - ${SRC}"
-    done
-} > "$MANIFEST"
+HASHFILE="${BACKUP_TMP}/hashes.sha256"
+find "$BACKUP_TMP" -type f -exec sha256sum {} \; > "$HASHFILE"
+echo "✔ Hashes gespeichert unter: $HASHFILE" | tee -a "$LOG"
 
 ############################################################
-### 5) UPLOAD ZU NEXTCLOUD
+# 5) MANIFEST ERZEUGEN
 ############################################################
 
-REMOTE_PATH="${REMOTE_NAME}:${REMOTE_DIR}/${BACKUP_NAME}"
+MANIFEST="${BACKUP_TMP}/manifest.yml"
 
-echo "Starte Upload zu Nextcloud: ${REMOTE_PATH}" | tee -a "$LOG"
-rclone copy "$TMP_DIR" "$REMOTE_PATH" -P | tee -a "$LOG"
+cat <<EOF > "$MANIFEST"
+backup_name: "$BACKUP_NAME"
+timestamp: "$TIMESTAMP"
+host: "$(hostname)"
+ip: "$(hostname -I | awk '{print $1}')"
+volumes:
+$(echo "$VOLUMES" | sed 's/^/  - /')
+bind_mounts:
+$(printf "%s\n" "${MOUNTS[@]}" | sed 's/^/  - /')
+EOF
 
-echo "✔️ Upload abgeschlossen." | tee -a "$LOG"
+echo "✔ Manifest erstellt: $MANIFEST" | tee -a "$LOG"
 
 ############################################################
-### 6) TEMP-DATEN LÖSCHEN
+# 6) UPLOAD
 ############################################################
 
-echo "Bereinige temporäre Backup-Daten..." | tee -a "$LOG"
-rm -rf "$TMP_DIR"
+echo "Starte Upload zu Nextcloud..." | tee -a "$LOG"
+
+rclone copy "$BACKUP_TMP" "${REMOTE_NAME}:${REMOTE_DIR}" -P | tee -a "$LOG"
+
+echo "✔ Upload abgeschlossen." | tee -a "$LOG"
+
+############################################################
+# 7) CLEANUP
+############################################################
+
+rm -rf "$BACKUP_TMP"
 
 echo "--------------------------------------------------------" | tee -a "$LOG"
 echo "Backup erfolgreich abgeschlossen!" | tee -a "$LOG"
-echo "Name: $BACKUP_NAME" | tee -a "$LOG"
-echo "Remote: $REMOTE_PATH" | tee -a "$LOG"
+echo "Name: ${BACKUP_NAME}" | tee -a "$LOG"
+echo "Remote: ${REMOTE_NAME}:${REMOTE_DIR}" | tee -a "$LOG"
 echo "--------------------------------------------------------" | tee -a "$LOG"
-

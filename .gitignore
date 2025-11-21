@@ -1,0 +1,4 @@
+opt/
+tmp/
+*.tar.gz
+/sys-backup-v4-live.tar.gz
